@@ -1,0 +1,160 @@
+package controllers
+
+import (
+	"github.com/labstack/echo"
+	"net/http"
+	"github.com/PuerkitoBio/goquery"
+	"net/url"
+	"net/http/cookiejar"
+	"github.com/pkg/errors"
+	"strconv"
+	_ "github.com/jinzhu/gorm/dialects/mysql"
+	"github.com/mitchellh/hashstructure"
+	. "github.com/vimsucks/apisucks/models"
+	"time"
+	"encoding/json"
+	"github.com/labstack/gommon/log"
+	"fmt"
+)
+
+const JWGL_LOGIN_URL = "http://jwgl.cust.edu.cn/teachwebsl/login.aspx"
+const JWGL_SCORE_URL = "http://jwgl.cust.edu.cn/teachweb/cjcx/StudentGrade.aspx"
+
+var JWGL_CONNECTION_ERROR = errors.New("error when connecting to jwgl")
+var JWGL_LOGIN_ERROR = errors.New("user id or password wrong")
+
+/*
+	@METHOD: POST
+	@URL: /cust/student/:id/grade
+	@FORM: password
+ */
+func GetStudentScore(c echo.Context) error {
+	id := c.Param("id")
+	password := c.FormValue("password")
+
+/*	if str, err := Redis.Get(id).Result(); err == nil {
+		log.Debug(fmt.Printf("Cache %s exists, reading from redis", id))
+		var student Student
+		json.Unmarshal([]byte(str), &student)
+		if student.Password == password {
+			return c.JSON(http.StatusOK, student.Years)
+		} else {
+			return c.String(http.StatusBadRequest, "Incorrect SID or password")
+		}
+	}*/
+
+	client, err := login(id, password)
+	if err == JWGL_CONNECTION_ERROR {
+		return c.String(http.StatusInternalServerError, err.Error())
+	} else if err == JWGL_LOGIN_ERROR {
+		return c.String(http.StatusBadRequest, err.Error())
+	}
+
+	student := Student{SID: id, Password: password}
+	err = InsertStudents([]Student{student})
+
+	resp, err := client.Get(JWGL_SCORE_URL)
+	if err != nil {
+		return c.String(http.StatusServiceUnavailable, err.Error())
+	}
+	doc, _ := goquery.NewDocumentFromReader(resp.Body)
+	var years []Year
+	var year *Year
+	var semester *Semester
+	doc.Find("tr").Next().Each(func(k int, s *goquery.Selection) {
+		selTd := s.Find("td")
+		length := selTd.Length()
+		selTd = selTd.First()
+		if length == 12 {
+			// 年 - 学期 - 成绩
+			yearGpa, _ := strconv.ParseFloat(selTd.Next().Text(), 64)
+			years = append(years, Year{Name: selTd.Text(), Gpa: yearGpa})
+			year = &years[len(years)-1]
+			semesterGpa, _ := strconv.ParseFloat(selTd.Next().Next().Next().Text(), 64)
+			year.Semesters = append(year.Semesters, Semester{Name: selTd.Next().Next().Text(), Gpa: semesterGpa})
+			semester = &year.Semesters[len(year.Semesters)-1]
+			score := parseScore(selTd.Next().Next().Next().Next())
+			semester.Scores = append(semester.Scores, score)
+		} else if length == 10 {
+			// 学期 - 成绩
+			semesterGpa, _ := strconv.ParseFloat(selTd.Next().Text(), 64)
+			year.Semesters = append(year.Semesters, Semester{Name: selTd.Text(), Gpa: semesterGpa})
+			semester = &year.Semesters[len(year.Semesters)-1]
+			score := parseScore(selTd.Next().Next())
+			semester.Scores = append(semester.Scores, score)
+		} else {
+			score := parseScore(selTd)
+			semester.Scores = append(semester.Scores, score)
+		}
+	})
+	oldHash, _ := hashstructure.Hash(student.Years, nil)
+	newHash, _ := hashstructure.Hash(years, nil)
+	if oldHash != newHash {
+		for _, year := range student.Years {
+			for _, semester := range year.Semesters {
+				// 使用 Unscoped，强制删除，而不是使用 gorm 的 Soft Delete 特性
+				DB.Unscoped().Delete(&semester.Scores)
+			}
+			DB.Unscoped().Delete(&year.Semesters)
+		}
+		DB.Unscoped().Delete(&student.Years)
+		student.Years = years
+		DB.Model(&student).Update(student)
+	}
+	if bytes, err := json.Marshal(student); err == nil {
+		if err = Redis.Set(id, string(bytes), 20*time.Minute).Err(); err != nil {
+			log.Error(err)
+		}
+	}
+	return c.JSON(http.StatusOK, student.Years)
+}
+
+// 使用成绩行的第一个 td 元素，解析出成绩 struct
+func parseScore(s *goquery.Selection) Score {
+	score := Score{}
+	score.Name = s.Text()
+	score.Type = s.Next().Text()
+	credit, _ := strconv.ParseFloat(s.Next().Next().Text(), 64)
+	score.Credit = credit
+	period, _ := strconv.Atoi(s.Next().Next().Next().Text())
+	score.Period = period
+	score.Score = s.Next().Next().Next().Next().Text()
+	score.Review = s.Next().Next().Next().Next().Next().Text()
+	score.ExamType = s.Next().Next().Next().Next().Next().Next().Text()
+	return score
+}
+
+func login(id, password string) (*http.Client, error) {
+	jar, _ := cookiejar.New(nil)
+	client := &http.Client{
+		Jar:     jar,
+		Timeout: 10 * time.Second,
+	}
+	// 先 GET 一遍登录页面，获取登录 Form 需要的 __EVENTVALIDATION 和 __VIEWSTATE 值
+	resp, err := client.Get(JWGL_LOGIN_URL)
+	if err != nil || resp.StatusCode != 200 {
+		return nil, JWGL_CONNECTION_ERROR
+	}
+	doc, _ := goquery.NewDocumentFromReader(resp.Body)
+	eventValidation, _ := doc.Find("#__EVENTVALIDATION").Attr("value")
+	viewState, _ := doc.Find("#__VIEWSTATE").Attr("value")
+
+	// 构造表单
+	form := url.Values{}
+	form.Add("__EVENTVALIDATION", eventValidation)
+	form.Add("__VIEWSTATE", viewState)
+	form.Add("txtUserName", id)
+	form.Add("txtPassWord", password)
+	form.Add("Button1", "登录")
+	resp, err = client.PostForm(JWGL_LOGIN_URL, form)
+	if err != nil || resp.StatusCode != 200 {
+		return nil, JWGL_CONNECTION_ERROR
+	}
+
+	// 检查是否登录成功，若成功会重定向至 index，检查首页是否出现学生姓名
+	doc, _ = goquery.NewDocumentFromReader(resp.Body)
+	if doc.Find("#StudentNameValueLabel").Length() == 0 {
+		return nil, JWGL_LOGIN_ERROR
+	}
+	return client, nil
+}

@@ -1,0 +1,12 @@
+CREATE TABLE IF NOT EXISTS `scores` (
+`id` INT UNSIGNED PRIMARY KEY AUTO_INCREMENT,
+`name` VARCHAR(30) NOT NULL,
+`type` VARCHAR(2) NOT NULL,
+`credit` DOUBLE NOT NULL,
+`period` INT(3) NOT NULL,
+`score` VARCHAR(8) DEFAULT "",
+`review` VARCHAR(5) DEFAULT  "",
+`exam_type` VARCHAR(5) DEFAULT  "",
+`semester_id` INT UNSIGNED NOT NULL,
+FOREIGN KEY (`semester_id`) REFERENCES `semesters`(`id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8;
