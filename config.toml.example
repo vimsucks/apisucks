@@ -1,0 +1,9 @@
+Host = "0.0.0.0"
+Port = 8000
+HttpsEnabled = false
+CertPath = ""
+KeyPath = ""
+DatabaseUrl = "root:root@/apisucks?charset=utf8&parseTime=True"
+RedisAddr = "localhost:6379"
+RedisPassword = "redis"
+RedisDB = 0
